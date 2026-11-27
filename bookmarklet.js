@@ -1,0 +1,318 @@
+(() => {
+  const extract = () => {
+    const STRIP = "button, svg, script, style, ywh-icon, ywh-icon-tooltip, ywh-copy-to-clipboard, ywh-share-twitter, ywh-button-export";
+    const BLOCK_TAGS = ["article", "aside", "blockquote", "div", "dl", "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "ul"];
+    const BLOCK_SELECTOR = BLOCK_TAGS.join(",");
+    const SEVERITIES = ["Low", "Medium", "High", "Critical"];
+    const BR = "\u0000";
+    let shift = 0;
+  
+    const squash = el => el?.textContent.replace(/\s+/g, " ").trim() ?? "";
+    const escapeCell = s => s.replace(/\|/g, "\\|");
+    const isBlock = el => BLOCK_TAGS.includes(el.localName) || el.querySelector(BLOCK_SELECTOR);
+    const isList = s => /^(- |\d+\. )/.test(s);
+  
+    const wrap = (text, mark) => {
+      const [, before, body, after] = text.match(/^(\s*)(.*?)(\s*)$/s);
+      return body ? before + mark + body + mark + after : text;
+    };
+  
+    const paragraph = text =>
+      text.replace(/[ \t\n]+/g, " ").split(BR).map(l => l.trim()).join("  \n").trim();
+  
+    const inline = node => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+      if (node.nodeType !== Node.ELEMENT_NODE) return "";
+      const content = () => [...node.childNodes].map(inline).join("");
+      switch (node.localName) {
+        case "strong":
+        case "b":
+          return wrap(content(), "**");
+        case "em":
+        case "i":
+          return wrap(content(), "_");
+        case "code":
+          return "`" + node.textContent.trim() + "`";
+        case "br":
+          return BR;
+        case "img":
+          return `![${node.alt}](${node.src})`;
+        case "a": {
+          const text = paragraph(content());
+          const href = node.href;
+          if (!href || href.startsWith("javascript:")) return text;
+          return !text || text === href ? `<${href}>` : `[${text}](${href})`;
+        }
+        default:
+          return content();
+      }
+    };
+  
+    const render = (el, tight = false) => {
+      const blocks = [];
+      let buffer = "";
+      const flush = () => {
+        const text = paragraph(buffer);
+        if (text) blocks.push(text);
+        buffer = "";
+      };
+      for (const child of el.childNodes) {
+        if (child.nodeType === Node.ELEMENT_NODE && isBlock(child)) {
+          flush();
+          const text = block(child);
+          if (text) blocks.push(text);
+        } else {
+          buffer += inline(child);
+        }
+      }
+      flush();
+      return blocks.reduce((acc, b, i) => {
+        if (i === 0) return b;
+        return acc + (tight || (isList(blocks[i - 1]) && isList(b)) ? "\n" : "\n\n") + b;
+      }, "");
+    };
+  
+    const list = el =>
+      [...el.children]
+        .filter(c => c.localName === "li")
+        .map((li, i) => {
+          const marker = el.localName === "ol" ? `${i + 1}. ` : "- ";
+          const indent = " ".repeat(marker.length);
+          return marker + render(li, true).split("\n").map((l, j) => (j && l ? indent + l : l)).join("\n");
+        })
+        .join("\n");
+  
+    const table = el => {
+      const rows = [...el.rows]
+        .map(r => [...r.cells].map(c => escapeCell(paragraph(inline(c)).replace(/\s*\n\s*/g, " "))))
+        .filter(r => r.some(Boolean));
+      if (!rows.length) return "";
+      const width = Math.max(...rows.map(r => r.length));
+      const line = r => `| ${Array.from({ length: width }, (_, i) => r[i] ?? "").join(" | ")} |`;
+      return [line(rows[0]), line(Array(width).fill("---")), ...rows.slice(1).map(line)].join("\n");
+    };
+  
+    const block = el => {
+      const tag = el.localName;
+      if (/^h[1-6]$/.test(tag)) {
+        const text = paragraph(inline(el));
+        return text && "#".repeat(Math.min(6, Math.max(3, +tag[1] + shift))) + " " + text;
+      }
+      switch (tag) {
+        case "hr":
+          return "---";
+        case "pre":
+          return "```\n" + el.textContent.replace(/\n+$/, "") + "\n```";
+        case "blockquote":
+          return render(el).split("\n").map(l => (l ? `> ${l}` : ">")).join("\n");
+        case "ul":
+        case "ol":
+          return list(el);
+        case "table":
+          return table(el);
+        default:
+          return render(el);
+      }
+    };
+  
+    const md = (el, headingShift = 0, drop = null) => {
+      if (!el) return "";
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll(STRIP).forEach(n => n.remove());
+      if (drop) clone.querySelector(drop)?.remove();
+      shift = headingShift;
+      return render(clone);
+    };
+  
+    const scopes = root => {
+      const rows = [...root.querySelectorAll("#program-scopes-table tbody tr:not(.rewards-row)")].map(row => {
+        const rewards = {};
+        const next = row.nextElementSibling;
+        if (next?.classList.contains("rewards-row")) {
+          next.querySelectorAll(".flex-column").forEach(b => {
+            rewards[squash(b.firstElementChild)] = squash(b.querySelector(".tag-content"));
+          });
+        }
+        return [
+          squash(row.querySelector(".mat-column-scope .scope")) || squash(row.querySelector(".mat-column-scope")),
+          squash(row.querySelector(".mat-column-type")),
+          squash(row.querySelector(".mat-column-assetValue")),
+          ...SEVERITIES.map(s => rewards[s] ?? ""),
+        ];
+      });
+  
+      const parts = [];
+      if (rows.length) {
+        const header = ["Scope", "Type", "Asset value", ...SEVERITIES];
+        const keep = header.map((_, i) => i === 0 || rows.some(r => r[i]));
+        const line = r => `| ${r.filter((_, i) => keep[i]).map(escapeCell).join(" | ")} |`;
+        parts.push([header, header.map(() => "---"), ...rows].map(line).join("\n"));
+      }
+  
+      const outOfScope = [...root.querySelectorAll("h3")].find(h => /out of scope/i.test(h.textContent));
+      const outOfScopeBody = md(outOfScope?.parentElement, 0, "h3");
+      if (outOfScopeBody) parts.push(`### Out of scope\n\n${outOfScopeBody}`);
+  
+      return parts.join("\n\n");
+    };
+  
+    const root = document.querySelector("#program-description-section");
+    if (!root) return null;
+  
+    const title = squash(document.querySelector(".program-title")) || document.title;
+    const summary = squash(document.querySelector("#program-card-information-section p"));
+    const head = [`# ${title}`, `<${location.origin}${location.pathname}>`, summary].filter(Boolean).join("\n\n");
+
+    const sections = [
+      ["Bug bounty description", md(root.querySelector("#program-rules-paragraph"), 2)],
+      ["Rewards", md(root.querySelector("#program-rewards"), 0, "h2")],
+      ["Scopes", scopes(root)],
+      ["Vulnerability types", md(root.querySelector("#program-vulneraibility-types, #program-vulnerability-types"), 0, "h2")],
+      ["Hunting requirements", md(root.querySelector("#hunting-requirements"), 0, "h2")],
+      ["Hunters collaboration", md(root.querySelector("#hunters-collaboration"), 0, "h2")],
+    ]
+      .map(([name, body]) => ({ name, body: body.trim() }))
+      .filter(s => s.body);
+
+    return { head, sections };
+  };
+
+  const compose = ({ head, sections }, selected) =>
+    [head, ...sections.filter(s => selected.has(s.name)).map(s => `## ${s.name}\n\n${s.body}`)].join("\n\n") + "\n";
+
+  const STORAGE_KEY = "ywh-md-hidden-sections";
+
+  const loadHidden = () => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(STORAGE_KEY)) ?? []);
+    } catch {
+      return new Set();
+    }
+  };
+
+  const showModal = program => {
+    document.getElementById("ywh-md-overlay")?.remove();
+    const slug = location.pathname.split("/").filter(Boolean).pop() ?? "program";
+    const hidden = loadHidden();
+    const selected = new Set(program.sections.map(s => s.name).filter(n => !hidden.has(n)));
+    let markdown = "";
+
+    const overlay = document.createElement("div");
+    overlay.id = "ywh-md-overlay";
+    overlay.style.cssText = "position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center";
+
+    const panel = document.createElement("div");
+    panel.style.cssText = "width:min(900px,90vw);height:80vh;display:flex;flex-direction:column;background:#1b1d23;color:#e6e6e6;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.5);font:13px system-ui,sans-serif";
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid #333";
+    const title = document.createElement("strong");
+    title.textContent = "Markdown export";
+    title.style.marginRight = "auto";
+
+    const makeButton = (label, onClick) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.style.cssText = "padding:5px 12px;border:0;border-radius:6px;background:#e60000;color:#fff;cursor:pointer";
+      button.addEventListener("click", e => onClick(button, e));
+      return button;
+    };
+
+    const pre = document.createElement("pre");
+    pre.style.cssText = "flex:1;margin:0;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,monospace;color:inherit;background:none;border:0";
+
+    const dropdown = document.createElement("div");
+    dropdown.style.position = "relative";
+    const menu = document.createElement("div");
+    menu.style.cssText = "display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:1;min-width:230px;padding:6px;background:#262932;border:1px solid #3a3d47;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.4)";
+    const toggle = makeButton("", (_, e) => {
+      e.stopPropagation();
+      menu.style.display = menu.style.display === "none" ? "block" : "none";
+    });
+    toggle.style.background = "#444";
+
+    const checkboxes = program.sections.map(({ name }) => {
+      const label = document.createElement("label");
+      label.style.cssText = "display:flex;gap:8px;align-items:center;padding:5px 6px;border-radius:4px;cursor:pointer;white-space:nowrap";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = selected.has(name);
+      box.addEventListener("change", () => {
+        box.checked ? selected.add(name) : selected.delete(name);
+        update();
+      });
+      label.append(box, name);
+      menu.append(label);
+      return [name, box];
+    });
+
+    const setAll = checked => {
+      for (const [name, box] of checkboxes) {
+        box.checked = checked;
+        checked ? selected.add(name) : selected.delete(name);
+      }
+      update();
+    };
+    const shortcuts = document.createElement("div");
+    shortcuts.style.cssText = "display:flex;gap:6px;padding:6px 6px 2px;border-top:1px solid #3a3d47;margin-top:4px";
+    const all = makeButton("All", () => setAll(true));
+    const none = makeButton("None", () => setAll(false));
+    for (const b of [all, none]) b.style.cssText += ";flex:1;padding:3px 8px;background:#444";
+    shortcuts.append(all, none);
+    menu.append(shortcuts);
+    menu.addEventListener("click", e => e.stopPropagation());
+    dropdown.append(toggle, menu);
+
+    function update() {
+      markdown = compose(program, selected);
+      pre.textContent = markdown;
+      toggle.textContent = `Sections (${selected.size}/${program.sections.length}) ▾`;
+      for (const { name } of program.sections) selected.has(name) ? hidden.delete(name) : hidden.add(name);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify([...hidden]));
+    }
+
+    const close = () => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+    };
+    const onKey = e => {
+      if (e.key !== "Escape") return;
+      if (menu.style.display !== "none") menu.style.display = "none";
+      else close();
+    };
+
+    const copy = makeButton("Copy", async button => {
+      await navigator.clipboard.writeText(markdown);
+      button.textContent = "Copied!";
+      setTimeout(() => (button.textContent = "Copy"), 1500);
+    });
+    const download = makeButton("Download .md", () => {
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([markdown], { type: "text/markdown" }));
+      link.download = `${slug}.md`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    });
+    const closeButton = makeButton("Close", close);
+    closeButton.style.background = "#444";
+
+    update();
+    header.append(title, dropdown, copy, download, closeButton);
+    panel.append(header, pre);
+    panel.addEventListener("click", () => (menu.style.display = "none"));
+    overlay.append(panel);
+    overlay.addEventListener("click", e => e.target === overlay && close());
+    document.addEventListener("keydown", onKey);
+    document.body.append(overlay);
+  };
+
+  const existing = document.getElementById("ywh-md-overlay");
+  if (existing) return existing.remove();
+  if (!/^https:\/\/yeswehack\.com\/programs\/[^/]+\/?$/.test(location.origin + location.pathname)) {
+    return alert("Open a YesWeHack program page first.");
+  }
+  const program = extract();
+  if (!program) return alert("No program description found on this page.");
+  showModal(program);
+})();
