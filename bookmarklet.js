@@ -180,6 +180,233 @@
   const compose = ({ head, sections }, selected) =>
     [head, ...sections.filter(s => selected.has(s.name)).map(s => `## ${s.name}\n\n${s.body}`)].join("\n\n") + "\n";
 
+  // ---- .envrc generator ----
+  const ENVRC_ID = "ywh-envrc-overlay";
+  const STORAGE_PREFIX = "ywh-envrc:";
+  const NON_WEB_HOSTS = new Set([
+    "github.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "play.google.com",
+    "apps.apple.com",
+    "itunes.apple.com",
+    "chromewebstore.google.com",
+    "addons.mozilla.org",
+  ]);
+  const USER_PLACEHOLDER =
+    /(?:<|\{\{?|\[|#)[^<>{}[\]#]*?(?:user[\s_-]*name|pseudo|nickname|handle)[^<>{}[\]#]*?(?:>|\}\}?|\]|#)/gi;
+
+  const squashText = el => el?.textContent.replace(/\s+/g, " ").trim() ?? "";
+
+  // "www.example.(fr|de)" -> ["www.example.fr", "www.example.de"]
+  const expand = s => {
+    const m = s.match(/\(([^()]*\|[^()]*)\)/);
+    if (!m) return [s];
+    return m[1].split("|").flatMap(alt => expand(s.slice(0, m.index) + alt + s.slice(m.index + m[0].length)));
+  };
+
+  const toHosts = raw => {
+    const token = raw.trim().split(/\s+/)[0] ?? "";
+    return expand(token)
+      .map(s =>
+        s
+          .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+          .split(/[/?#]/)[0]
+          .replace(/[()\]]+$/, "")
+          .replace(/:\d+$/, "")
+          .toLowerCase(),
+      )
+      .filter(s => /^([a-z0-9*-]+\.)+[a-z]{2,}$/.test(s) && !NON_WEB_HOSTS.has(s));
+  };
+
+  const username = () =>
+    (document.querySelector("#logged-user-menu img[title]")?.title ?? "").replace(/^Signed in as\s*/i, "").trim();
+
+  // "kiteworks-public-bug-bounty-program-1" -> "kiteworks", "bug-bounty-program-blablacar" -> "blablacar"
+  const NOISE = /^(public|private|open|bug|bounty|bugbounty|bbp|vdp|program|programme|policy|vulnerability|disclosure|\d+)$/;
+  const defaultProgram = slug => {
+    const words = slug.toLowerCase().split("-");
+    while (words.length > 1 && NOISE.test(words.at(-1))) words.pop();
+    while (words.length > 1 && /^(bug|bounty|bugbounty|program|programme)$/.test(words[0])) words.shift();
+    return words.join("-");
+  };
+
+  const scopeHosts = () => {
+    const hosts = [...document.querySelectorAll("#program-scopes-table tbody tr:not(.rewards-row)")]
+      .map(row => squashText(row.querySelector(".mat-column-scope .scope")) || squashText(row.querySelector(".mat-column-scope")))
+      .flatMap(toHosts);
+    return [...new Set(hosts)];
+  };
+
+  const rateLimit = text => {
+    const patterns = [
+      /(\d+)\s*(?:requests?|requêtes?|req|rq)s?\s*(?:\/|per|par)\s*(?:seconde?|sec|s)\b/i,
+      /(\d+)\s*(?:rps|req\/s)\b/i,
+      /(?:rate[\s-]*limit\w*|max(?:imum)?)\D{0,30}?(\d+)\s*(?:\/\s*s\b|per\s+second)/i,
+    ];
+    for (const re of patterns) {
+      const m = text.match(re);
+      if (m) return m[1];
+    }
+    return null;
+  };
+
+  const requiredUserAgent = user => {
+    const heading = [...document.querySelectorAll("#hunting-requirements h3")].find(h => /user[\s-]*agent/i.test(h.textContent));
+    const block = heading?.parentElement;
+    if (!block) return null;
+    let value = squashText(block.querySelector("strong, b, code"));
+    if (!value) {
+      const m = squashText(block).match(/['"‘’“”]\s*([^'"‘’“”]+?)\s*['"‘’“”]/);
+      value = m?.[1] ?? "";
+    }
+    if (!value) return null;
+    return user ? value.replace(USER_PLACEHOLDER, user) : value;
+  };
+
+  const detectEnvrc = slug => {
+    const user = username();
+    const program = defaultProgram(slug);
+    const text = squashText(document.querySelector("#program-description-section"));
+    const rate = rateLimit(text);
+    const ua = requiredUserAgent(user);
+    return {
+      values: {
+        program,
+        scope: scopeHosts().join(","),
+        ratelimit: rate ?? "",
+        useragent: ua ? `-${ua.replace(/^-+/, "")}` : "",
+      },
+    };
+  };
+
+  const shellEscape = s => s.replace(/[\\"$`]/g, "\\$&");
+
+  const renderEnvrc = v => {
+    const q = k => `"${shellEscape(v[k])}"`;
+    return `export program=${q("program")}
+export scope=${q("scope")}
+export ratelimit=${q("ratelimit")}
+export useragent=${q("useragent")}
+`;
+  };
+
+  const showEnvrc = slug => {
+    const key = STORAGE_PREFIX + slug;
+    const detected = detectEnvrc(slug);
+    let saved = {};
+    try {
+      saved = JSON.parse(localStorage.getItem(key)) ?? {};
+    } catch {}
+    const values = { ...detected.values, ...saved };
+    let output = "";
+
+    const overlay = document.createElement("div");
+    overlay.id = ENVRC_ID;
+    overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center";
+
+    const panel = document.createElement("div");
+    panel.style.cssText = "width:min(900px,90vw);max-height:85vh;display:flex;flex-direction:column;background:#1b1d23;color:#e6e6e6;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.5);font:13px system-ui,sans-serif";
+
+    const makeButton = (label, onClick, color = "#e60000") => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.style.cssText = `padding:5px 12px;border:0;border-radius:6px;background:${color};color:#fff;cursor:pointer`;
+      button.addEventListener("click", () => onClick(button));
+      return button;
+    };
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid #333";
+    const title = document.createElement("strong");
+    title.textContent = ".envrc export";
+    title.style.marginRight = "auto";
+
+    const form = document.createElement("div");
+    form.style.cssText = "display:grid;grid-template-columns:auto 1fr;gap:6px 10px;align-items:center;padding:12px 14px;border-bottom:1px solid #333";
+
+    const inputs = {};
+    for (const name of ["program", "scope", "ratelimit", "useragent"]) {
+      const label = document.createElement("label");
+      label.textContent = name;
+      label.style.cssText = "font-family:ui-monospace,monospace;color:#aaa";
+      const field = document.createElement(name === "scope" ? "textarea" : "input");
+      field.value = values[name];
+      field.spellcheck = false;
+      field.style.cssText = "width:100%;box-sizing:border-box;padding:5px 8px;background:#262932;color:inherit;border:1px solid #3a3d47;border-radius:6px;font:12px ui-monospace,monospace;resize:vertical";
+      if (name === "scope") field.rows = 3;
+      field.addEventListener("input", () => {
+        values[name] = name === "scope" ? field.value.replace(/[\s,]+/g, ",").replace(/^,|,$/g, "") : field.value.trim();
+        localStorage.setItem(key, JSON.stringify(values));
+        update();
+      });
+      inputs[name] = field;
+      form.append(label, field);
+    }
+
+    const hint = document.createElement("div");
+    hint.style.cssText = "grid-column:2;color:#888;font-size:11px";
+    const setHint = withSaved => {
+      hint.textContent = withSaved ? "showing saved edits" : "";
+      hint.style.display = hint.textContent ? "" : "none";
+    };
+    setHint(Object.keys(saved).length > 0);
+    form.append(hint);
+
+    const pre = document.createElement("pre");
+    pre.style.cssText = "flex:1;margin:0;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-all;font:12px ui-monospace,monospace;color:inherit;background:none;border:0";
+
+    function update() {
+      output = renderEnvrc(values);
+      pre.textContent = output;
+    }
+
+    const close = () => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey, true);
+    };
+    const onKey = e => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      close();
+    };
+
+    const copy = makeButton("Copy", async button => {
+      await navigator.clipboard.writeText(output);
+      button.textContent = "Copied!";
+      setTimeout(() => (button.textContent = "Copy"), 1500);
+    });
+    const download = makeButton("Download", () => {
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([output], { type: "text/plain" }));
+      link.download = `envrc-${values.program.replace(/[^\w.-]+/g, "-") || slug}.txt`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    });
+    const reset = makeButton(
+      "Reset",
+      () => {
+        localStorage.removeItem(key);
+        Object.assign(values, detected.values);
+        for (const [name, field] of Object.entries(inputs)) field.value = values[name];
+        setHint(false);
+        update();
+      },
+      "#444",
+    );
+    const closeButton = makeButton("Close", close, "#444");
+
+    update();
+    header.append(title, reset, copy, download, closeButton);
+    panel.append(header, form, pre);
+    overlay.append(panel);
+    overlay.addEventListener("click", e => e.target === overlay && close());
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(overlay);
+  };
+
+  // ---- Markdown export ----
   const STORAGE_KEY = "ywh-md-hidden-sections";
 
   const loadHidden = () => {
@@ -297,6 +524,11 @@
     const closeButton = makeButton("Close", close);
     closeButton.style.background = "#444";
 
+    const envrcButton = makeButton(".envrc", () => showEnvrc(slug));
+    envrcButton.title = "Generate .envrc for this program";
+    envrcButton.style.cssText += ";position:fixed;right:24px;bottom:24px;padding:10px 16px;border-radius:999px;font:600 13px ui-monospace,monospace;box-shadow:0 4px 14px rgba(0,0,0,.5)";
+    overlay.append(envrcButton);
+
     update();
     header.append(title, dropdown, copy, download, closeButton);
     panel.append(header, pre);
@@ -308,7 +540,10 @@
   };
 
   const existing = document.getElementById("ywh-md-overlay");
-  if (existing) return existing.remove();
+  if (existing) {
+    document.getElementById(ENVRC_ID)?.remove();
+    return existing.remove();
+  }
   if (!/^https:\/\/yeswehack\.com\/programs\/[^/]+\/?$/.test(location.origin + location.pathname)) {
     return alert("Open a YesWeHack program page first.");
   }
